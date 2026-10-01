@@ -45,22 +45,35 @@ from .models import (
     SealRequest,
     SealResponse,
 )
-from .storage import BatchStore, EventStore, IdempotencyConflict, SealRecord, StoredEvent
+from .storage import (
+    SEAL_CONFLICT,
+    SEAL_DUPLICATE,
+    BatchStore,
+    IdempotencyConflict,
+    SealRecord,
+    StorageError,
+    StoredEvent,
+    create_store,
+)
 
 logger = logging.getLogger("calibration")
 
 settings = get_settings()
-store = EventStore()
+store = create_store(
+    settings.storage_backend, path=settings.sqlite_path
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> None:
     logging.basicConfig(level=settings.log_level.upper())
     logger.info(
-        "calibration-timeline-service %s started on %s:%s (storage=memory)",
+        "calibration-timeline-service %s started on %s:%s (storage=%s%s)",
         __version__,
         settings.host,
         settings.port,
+        settings.storage_backend,
+        f", db={settings.sqlite_path}" if settings.storage_backend == "sqlite" else "",
     )
     yield
     logger.info("calibration-timeline-service shutting down")
@@ -88,6 +101,17 @@ async def conflict_handler(_: Request, exc: IdempotencyConflict) -> JSONResponse
                 "different event payload"
             )
         },
+    )
+
+
+@app.exception_handler(StorageError)
+async def storage_failure_handler(_: Request, exc: StorageError) -> JSONResponse:
+    # A storage failure must be reported explicitly; it is never treated as
+    # an empty/unknown batch.
+    logger.error("storage failure: %s", exc)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": f"storage unavailable: {exc}"},
     )
 
 
@@ -120,7 +144,9 @@ def _sanitize_errors(value: object) -> object:
 
 @app.get("/health", response_model=HealthResponse, tags=["ops"])
 def health() -> HealthResponse:
-    return HealthResponse(status="ok", storage="memory", version=__version__)
+    return HealthResponse(
+        status="ok", storage=settings.storage_backend, version=__version__
+    )
 
 
 @app.post(
@@ -148,9 +174,11 @@ def submit_event(batch_id: str, event: MeasurementEvent) -> IngestResponse:
         unit=event.unit,
         withdrawn=event.withdrawn,
     )
+    # Decide, persist and snapshot in one atomic storage transaction (the
+    # revision row and its idempotency-key mapping commit together): the
+    # returned result reflects exactly the stored post-commit snapshot.
     with store.lock:
-        status = store.add(stored)
-        batch = store.get_batch(batch_id)
+        status, batch = store.add_view(stored)
         result = evaluate_batch(batch_id, batch)
     return IngestResponse(
         status=status,
@@ -187,12 +215,11 @@ def preview_event(batch_id: str, event: MeasurementEvent) -> PreviewResponse:
         unit=event.unit,
         withdrawn=event.withdrawn,
     )
-    # One lock acquisition for the whole decision + evaluation: the preview is
+    # One transaction for the whole decision + snapshot: the preview is
     # computed against one consistent batch snapshot, the same guarantee a
-    # concurrent real submission gets.
+    # concurrent real submission gets. No idempotency key is registered.
     with store.lock:
-        status = store.classify_submission(stored)
-        batch = store.get_batch(batch_id)
+        status, batch = store.preview_view(stored)
         if status == "duplicate":
             # An exact replay changes nothing: before and after are the same
             # snapshot and no key is occupied by the preview itself. A batch
@@ -444,24 +471,19 @@ def seal_batch(batch_id: str, request: SealRequest) -> SealResponse:
             status_code=422,
             detail="batch_id in path and body must match",
         )
-    # One lock acquisition for the whole decision + snapshot: the replay
-    # check, the hash/completeness validation and the evidence capture all
-    # observe one consistent batch snapshot.
-    with store.lock:
-        existing = store.get_seal(batch_id, request.seal_id)
-        if existing is not None:
-            if existing.timeline_hash == request.timeline_hash:
-                # Exact replay of the original request: return the frozen
-                # snapshot, even if the live batch has moved on since.
-                return _seal_response("duplicate", existing)
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"seal {request.seal_id!r} already exists for batch "
-                    f"{batch_id!r} with a different request"
-                ),
-            )
-        batch = store.get_batch(batch_id)
+    # One storage transaction for the replay check, hash/completeness
+    # validation and evidence freeze: all three observe one consistent batch
+    # snapshot and the seal row is inserted against that same snapshot, even
+    # across service processes.
+    candidate = SealRecord(
+        batch_id=batch_id,
+        seal_id=request.seal_id,
+        timeline_hash=request.timeline_hash,
+        evidence={},
+        evidence_digest="",
+    )
+
+    def prepare(batch: BatchStore | None) -> SealRecord:
         if batch is None or not batch.events:
             raise HTTPException(
                 status_code=404, detail=f"batch {batch_id!r} not found"
@@ -486,14 +508,26 @@ def seal_batch(batch_id: str, request: SealRequest) -> SealResponse:
                     f"{result['revisions_invalid']} invalid revision(s) remain"
                 ),
             )
-        record = SealRecord(
+        return SealRecord(
             batch_id=batch_id,
             seal_id=request.seal_id,
             timeline_hash=request.timeline_hash,
             evidence=evidence,
             evidence_digest=hash_seal_evidence(evidence),
         )
-        store.add_seal(record)
+
+    with store.lock:
+        outcome, record = store.create_seal(candidate, prepare)
+    if outcome == SEAL_DUPLICATE:
+        return _seal_response("duplicate", record)
+    if outcome == SEAL_CONFLICT:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"seal {request.seal_id!r} already exists for batch "
+                f"{batch_id!r} with a different request"
+            ),
+        )
     return _seal_response("sealed", record)
 
 
@@ -532,12 +566,12 @@ def recall_seal(batch_id: str, seal_id: str) -> SealRecallResponse:
     "/admin/reset",
     response_model=ResetResponse,
     tags=["ops"],
-    summary="Clear all in-memory state",
+    summary="Clear all batches, revisions and seals from storage",
 )
 def reset_state() -> ResetResponse:
     batches_removed, events_removed, seals_removed = store.reset()
     logger.warning(
-        "in-memory state reset: removed %d events across %d batches and %d seals",
+        "state reset: removed %d events across %d batches and %d seals",
         events_removed,
         batches_removed,
         seals_removed,

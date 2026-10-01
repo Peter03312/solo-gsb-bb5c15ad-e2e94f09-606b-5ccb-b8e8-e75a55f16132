@@ -12,7 +12,9 @@
 **一组冗余传感器**做**可信多数投票（majority）**。出厂留档时还可把
 **已完成批次封存（seal）**为一份不可改写的证据快照：冻结当时全部修订与
 折叠结果并生成确定性证据摘要，之后可随时回查并核对实时批次是否仍与封存
-一致。全部状态保存在**进程内存**中，可随时重置。
+一致。批次修订、幂等键与封存证据默认保存在**持久化的 SQLite 存储**（WAL
+模式）中：服务重启后仍然保留，并可被多个服务进程共享；也可切换回原有
+**进程内存**模式。可随时重置全部持久状态。
 
 ---
 
@@ -32,8 +34,15 @@ docker compose up --build
 
 停止：`Ctrl+C`（或另一终端执行 `docker compose down`）。
 
+> Compose 默认使用 **SQLite 持久后端**，数据库文件位于命名卷
+> `calibration-data`（容器内 `/data/calibration.db`）：`docker compose
+> restart` / 升级镜像后全部批次、幂等键与封存证据都还在；起多个容器/进程
+> 指向同一文件时，冲突判定与封存写入由数据库事务原子串行化。
+> 如需连同数据一起删除：`docker compose down -v`。
+>
 > 依赖在镜像构建阶段安装（见 `Dockerfile`），路由、日志等初始化在进程启动时
-> 通过 FastAPI lifespan 完成，无需额外迁移步骤。
+> 通过 FastAPI lifespan 完成，存储文件与表结构在首次启动时自动创建，
+> 无需额外迁移步骤。
 
 ### 不用 Docker 时（本地 Python 3.11）
 
@@ -61,8 +70,47 @@ pytest -q
 | `CAL_HOST`       | `0.0.0.0` | 监听地址                   |
 | `CAL_PORT`       | `8080`     | 监听/映射端口              |
 | `CAL_LOG_LEVEL`  | `info`     | 日志级别                   |
+| `CAL_STORAGE_BACKEND` | `memory`（本地直跑）/ `sqlite`（Compose） | 存储后端：`sqlite` 持久化且可多进程共享；`memory` 为进程内存（原有行为） |
+| `CAL_SQLITE_PATH` | `/data/calibration.db` | SQLite 数据库文件；父目录自动创建，需在该路径挂载卷/宿主目录才能持久化 |
+| `CAL_SQLITE_BUSY_TIMEOUT_MS` | `5000` | 等待其他进程释放 SQLite 写锁的毫秒数；超时后明确返回 `503` |
 
-数据**只存在内存**：进程重启或调用重置接口后全部丢失，这是预期行为。
+### 存储语义（两种后端行为一致）
+
+* **持久化**：`sqlite` 后端把修订、幂等键映射与封存证据写入同一个
+  WAL 模式数据库文件。服务重启或起多个 `uvicorn`/容器进程，只要指向同一
+  文件，看到的就是同一份状态；读不阻塞写、写与写由 `BEGIN IMMEDIATE`
+  事务串行化。
+* **原子保存**：一次提交的「幂等键判定 → 修订判定 → 修订落库 → 键映射
+  落库 → 批次快照」在同一个事务内完成。并发提交同一修订或同一幂等键时，
+  跨进程也恰好只有一个 `accepted`，其余按内容返回 `duplicate` 或 `409`
+  冲突；同修订同内容换新键重放仍登记新键（修订与键映射原子写入），返回
+  `duplicate`。
+* **预览不落地**：`events:preview` 只在一个只读事务里读取同一时点的批次
+  快照做判定与模拟折叠，不写任何行、不占用幂等键，其他进程也观察不到它。
+* **封存原子化**：封存的「重放判定 → 当前 `timeline_hash` 校验 → 完整性
+  校验 → 冻结全部修订与折叠结果入库」在同一个写事务内完成。同批次同
+  `seal_id` 的原请求重放返回原证据（`duplicate`）；异参重放返回 `409`
+  且原证据不变；封存后继续提交修订不会改写既有证据，回查接口实时比较
+  持久封存与当前批次。
+* **重置**：`POST /admin/reset` 清空全部批次、幂等键与封存，并返回准确的
+  `batches_removed` / `events_removed` / `seals_removed` 计数。
+* **存储故障明确报错**：数据库打不开、IO 故障或锁等待超时时，相关接口返回
+  `503 {"detail": "storage unavailable: ..."}`，**不会**把读不到的批次
+  误报成 404 空批次。
+
+本地不使用 Docker 时，默认仍是**内存后端**（进程重启即清空，兼容原有行为）。
+启用持久存储示例：
+
+```bash
+CAL_STORAGE_BACKEND=sqlite CAL_SQLITE_PATH=./data/calibration.db \
+  uvicorn app.main:app --host 0.0.0.0 --port 8080
+# 多进程共享同一份状态：
+CAL_STORAGE_BACKEND=sqlite CAL_SQLITE_PATH=./data/calibration.db \
+  uvicorn app.main:app --host 0.0.0.0 --port 8081
+```
+
+> SQLite 适合单节点多进程部署（如多个 uvicorn worker / sidecar）。
+> 所有副本必须挂载同一个可写文件；不要把多个主机上的独立文件当作共享存储。
 
 ---
 
@@ -812,12 +860,20 @@ $ curl -s localhost:8080/api/v1/batches/B42/seals/SEAL-2026-001
 }
 ```
 
-### `POST /admin/reset` — 清空全部内存状态
+### `POST /admin/reset` — 清空全部批次与封存
 
-返回被清除的批次数、事件数与封存数（`seals_removed`）；封存记录随重置
-一并清除。
+清空当前存储后端中的全部批次修订、幂等键与封存，并返回被清除的批次数、
+事件数与封存数（`seals_removed`）。SQLite 后端下这些数据从数据库中删除；
+若同时也想删除数据库文件所在的卷，使用 `docker compose down -v`。
 
 ### `GET /health` — 存活检查
+
+```json
+{ "status": "ok", "storage": "sqlite", "version": "1.5.0" }
+```
+
+`storage` 如实标识当前后端：`"sqlite"`（持久）或 `"memory"`（进程内存）；
+其余字段与历史响应完全一致。
 
 ---
 
@@ -899,8 +955,23 @@ curl -s -X POST localhost:8080/api/v1/batches/B42/seals \
 #      evidence_digest 为覆盖两者的确定性 SHA-256 摘要
 curl -s localhost:8080/api/v1/batches/B42/seals/SEAL-2026-001
 #   -> 返回冻结证据与摘要；consistent 表示实时批次证据是否仍与封存一致
+#      （封存证据持久保存：服务重启后仍可回查，后续修订不改写原证据）
 curl -s -X POST localhost:8080/admin/reset
-#   -> 连同封存记录一并清除（seals_removed）
+#   -> 连同全部批次与幂等键一并清除（seals_removed），计数准确返回
+```
+
+重启后数据仍在（`sqlite` 后端）的最小验证：
+
+```bash
+# 1) 提交并封存
+curl -s -X POST localhost:8080/api/v1/batches/B42/events \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"B42","sensor_id":"S1","revision_id":"v1","parent_id":"ROOT",
+       "idempotency_key":"e1","start_ns":0,"end_ns":300,"value":1.0,"unit":"C"}'
+# 2) 重启服务（docker compose restart / 重启 uvicorn）
+# 3) 状态仍在：同一请求重放 -> "duplicate"；封存回查仍返回冻结证据
+curl -s localhost:8080/api/v1/batches/B42/result | jq .revisions_total   # -> 1
+curl -s localhost:8080/health | jq .storage                              # -> "sqlite"
 ```
 
 撤回某一段（墓碑，区间内被擦除）：
@@ -922,10 +993,10 @@ curl -s -X POST localhost:8080/admin/reset
 ├── app/
 │   ├── main.py       # FastAPI 路由：ingest / preview / result / sample / compare / quality-gate / release / majority / seals / reset / health
 │   ├── engine.py     # 因果分类、区间切分折叠、预览影响计算、采样点查询、跨批次差异对比、质量门禁扫描、设备放行扫描、冗余传感器可信多数投票、批次封存证据与摘要、缺口与哈希（纯函数引擎）
-│   ├── storage.py    # 线程安全的内存存储、幂等判定、无副作用的提交预览判定与不可改写封存记录
+│   ├── storage.py    # 存储后端：内存（EventStore）与 SQLite WAL（SqliteEventStore，多进程共享/重启持久）；原子提交与封存事务、幂等判定、无副作用预览判定与不可改写封存记录
 │   ├── models.py     # Pydantic 请求/响应模型与校验
-│   └── config.py     # CAL_ 前缀环境变量配置
-├── tests/            # pytest（API 端到端 + 引擎单测，共 188 个用例）
+│   └── config.py     # CAL_ 前缀环境变量配置（含 CAL_STORAGE_BACKEND / CAL_SQLITE_PATH）
+├── tests/            # pytest（API 端到端 + 引擎单测 + SQLite 持久化/多进程并发，共 203 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

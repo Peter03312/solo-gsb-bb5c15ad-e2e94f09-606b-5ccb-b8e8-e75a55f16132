@@ -10,6 +10,15 @@ services:
       CAL_HOST: "0.0.0.0"
       CAL_PORT: "8080"
       CAL_LOG_LEVEL: "info"
+      # Durable, multi-process-safe storage: revisions, idempotency keys and
+      # seal evidence live in one WAL-mode SQLite file under the data volume.
+      # Set CAL_STORAGE_BACKEND=memory to keep the original in-memory mode.
+      CAL_STORAGE_BACKEND: "sqlite"
+      CAL_SQLITE_PATH: "/data/calibration.db"
+      CAL_SQLITE_BUSY_TIMEOUT_MS: "5000"
+    volumes:
+      # Survives container restarts and is shared by every replica/process.
+      - calibration-data:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health').status==200 else 1)"]
@@ -17,3 +26,6 @@ services:
       timeout: 3s
       retries: 5
       start_period: 3s
+
+volumes:
+  calibration-data:

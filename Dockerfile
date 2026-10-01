@@ -15,6 +15,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
+# Default mount point for the durable SQLite database (named volume in
+# docker-compose.yml). The directory is created at build time so the volume
+# inherits ownership and the sqlite backend can write on first start.
+RUN mkdir -p /data
+
 EXPOSE 8080
 
 # Dependencies are installed at image build; initialization (logging, routes)
