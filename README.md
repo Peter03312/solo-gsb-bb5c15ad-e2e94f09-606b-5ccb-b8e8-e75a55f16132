@@ -12,7 +12,10 @@
 **一组冗余传感器**做**可信多数投票（majority）**。出厂留档时还可把
 **已完成批次封存（seal）**为一份不可改写的证据快照：冻结当时全部修订与
 折叠结果并生成确定性证据摘要，之后可随时回查并核对实时批次是否仍与封存
-一致。全部状态保存在**进程内存**中，可随时重置。
+一致。修订、幂等键映射与封存证据默认保存在**持久化的 SQLite 存储**中，
+服务重启后仍然保留，并可由同一数据库文件上的**多个服务进程共享**；
+也可通过配置切换回进程内存模式。可随时重置（重置会连同持久化数据一并
+清除并返回准确计数）。
 
 ---
 
@@ -30,16 +33,32 @@ docker compose up --build
 - 交互式 API 文档（Swagger UI）：<http://localhost:8080/docs>
 - OpenAPI 描述：<http://localhost:8080/openapi.json>
 
+Compose 默认以 **2 个 uvicorn worker 进程**启动，二者通过同一个 SQLite
+数据库文件（WAL 模式，挂载在命名卷 `calibration-data` 上）共享全部状态：
+无论请求落到哪个进程，修订、幂等键与封存证据都一致；写入在 SQLite
+`BEGIN IMMEDIATE` 事务级串行，同一修订/幂等键的并发提交仍严格返回一个
+`accepted`、其余 `duplicate`（或负载冲突 `409`）。数据随命名卷保留，
+`docker compose restart` 或重建容器后不丢失；`docker compose down -v`
+才会删除卷（或调用 `POST /admin/reset` 清空数据）。
+
 停止：`Ctrl+C`（或另一终端执行 `docker compose down`）。
 
 > 依赖在镜像构建阶段安装（见 `Dockerfile`），路由、日志等初始化在进程启动时
-> 通过 FastAPI lifespan 完成，无需额外迁移步骤。
+> 通过 FastAPI lifespan 完成，无需额外迁移步骤：SQLite 表结构在服务首次
+> 启动时自动创建（幂等 `CREATE TABLE IF NOT EXISTS`）。
 
 ### 不用 Docker 时（本地 Python 3.11）
 
 ```bash
 pip install -r requirements.txt
+# 默认使用当前目录下的 SQLite 文件 data/calibration.db（父目录自动创建）
 uvicorn app.main:app --host 0.0.0.0 --port 8080
+
+# 多进程共享同一数据库（任意一种启动方式均可，指向同一路径即可）
+uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 2
+
+# 切回进程内存模式（重启即丢失）
+CAL_STORAGE=memory uvicorn app.main:app --host 0.0.0.0 --port 8080
 ```
 
 运行测试：
@@ -48,6 +67,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 pip install -r requirements-dev.txt
 pytest -q
 ```
+
+> 测试套件默认强制使用内存后端（见 `tests/conftest.py` 中的
+> `CAL_STORAGE=memory`），不会在仓库里创建数据库；持久化行为由
+> `tests/test_persistence_sqlite.py` 单独覆盖（含两个真实 OS 进程共享、
+> 双 uvicorn worker 冒烟、重启后封存/幂等回放与存储故障 503）。
 
 ---
 
@@ -61,8 +85,25 @@ pytest -q
 | `CAL_HOST`       | `0.0.0.0` | 监听地址                   |
 | `CAL_PORT`       | `8080`     | 监听/映射端口              |
 | `CAL_LOG_LEVEL`  | `info`     | 日志级别                   |
+| `CAL_STORAGE`    | `sqlite`   | 存储后端：`sqlite`（持久化、多进程共享）或 `memory`（进程内存，重启即失） |
+| `CAL_SQLITE_PATH` | `data/calibration.db` | `sqlite` 模式的数据库文件路径；父目录自动创建，库旁会产生 `-wal`/`-shm` 文件。不允许填 `:memory:`（不共享、不持久） |
+| `CAL_SQLITE_BUSY_TIMEOUT_MS` | `10000` | 等待其他进程释放 SQLite 写锁的毫秒数，超时按存储故障处理 |
 
-数据**只存在内存**：进程重启或调用重置接口后全部丢失，这是预期行为。
+**存储语义：**
+
+- `sqlite`（默认）：修订、幂等键映射、封存证据全部落盘。服务重启或容器
+  重建（保留数据卷）后仍可查询、重放；多个进程（如 `--workers N`）打开
+  同一文件时共享同一份数据。每个写入接口在**一个 `BEGIN IMMEDIATE`
+  事务**内完成“判定 + 写入 + 求值”，该事务同时是跨进程临界区：修订与
+  其幂等键映射原子提交；封存的“查重 → 校验 `timeline_hash`/完整性 →
+  冻结证据 → 落库”也在同一事务内原子完成，并发提交无法插入其间。
+  只读接口在同一快照事务内取数，预览读取的是同一时点的批次快照且不落
+  任何数据。
+- `memory`：历史行为，所有状态仅存进程内存，重启或重置即清空。
+- **存储故障不等于空批次**：数据库无法打开、读写失败时接口返回
+  **`503`**（`{"detail": "storage unavailable: ..."}`），绝不会把故障
+  伪装成 `404`/空结果；启动阶段无法初始化数据库则进程直接失败退出
+  （fail fast），不会静默降级到空内存。
 
 ---
 
@@ -83,10 +124,11 @@ pytest -q
   因此最终时间线与事件到达顺序无关（有排列不变性测试保证）。
 - **撤回（withdrawn=true）是墓碑**：在其区间内把已有标定值擦除为
   `state="withdrawn"`、`value=null`；撤回修订的后代仍可在因果上重新写回值。
-- **幂等**：
+- **幂等**（持久化存储中跨重启、跨进程同样生效）：
   - 相同 `idempotency_key` + 完全相同负载 → 返回 `status="duplicate"`，状态不变；
   - 相同 `idempotency_key` 但负载不同（或同 `revision_id` 内容不同）→ `409 Conflict`；
-  - 同一 `revision_id` + 相同内容即使换了幂等键也算重复。
+  - 同一 `revision_id` + 相同内容即使换了幂等键也算重复，**新键会被登记**，
+    修订与键映射在同一事务内原子保存。
 - **提交预览（preview，见 4.2）**：传入与提交完全相同的负载，按相同的校验、
   幂等冲突与因果折叠规则计算，但**不写入任何事件、不占用幂等键、不创建批次**。
   预览返回本次为 `submittable`（可提交）还是 `duplicate`（重复）、预览前后的
@@ -97,7 +139,8 @@ pytest -q
   `gaps_added` 中反映新增缺口；补传缺失父修订时，原本被阻塞的后代被激活，
   其影响会体现在 `changed_intervals` 与 `gaps_removed` 中。相同修订或幂等键
   的冲突返回与提交一致的 `409`，非法负载返回 `422`；预览与并发提交各自基于
-  同一次加锁内的一致批次快照计算。
+  同一事务（跨进程加锁）内的一致批次快照计算，且预览**不写库**：重启后
+  同样查不到预览产生的批次或键占用。
 - 结果中包含两个 SHA-256 内容哈希：每个传感器的 `segments_hash`
   和整批的 `timeline_hash`，可用于比对一致性与去重校验。
 - 相邻且状态、值、单位、来源修订完全相同的片段会被合并；来源修订不同则保留边界。
@@ -165,16 +208,19 @@ pytest -q
     的 SHA-256：快照输入不变则哈希不变，与窗口、单位、`q` 和阈值无关。
 - **批次封存**（见 4.9）把已完成批次固定为一份可复核的出厂留档证据。
   封存请求携带批次号、调用方自定义的**封存号**以及调用方先前取得的
-  `timeline_hash`；在**同一次加锁的同一批次快照**内核对哈希且批次
-  `complete=true`（无 blocked/invalid 修订）后，冻结**当时全部修订**
+  `timeline_hash`；在**同一事务（跨进程加锁）的同一批次快照**内核对哈希且
+  批次 `complete=true`（无 blocked/invalid 修订）后，冻结**当时全部修订**
   （按 `(sensor_id, revision_id)` 排序的完整记录）与**折叠结果**，并生成
   覆盖两者的确定性 SHA-256 **证据摘要**（`evidence_digest`，与修订到达
-  顺序无关）。相同批次下相同封存号 + 相同请求的重放返回**原快照**
-  （`status="duplicate"`，即使实时批次已变化）；封存号相同但参数不同
-  → `409`；批次不存在 → `404`；哈希已变化或仍有 blocked/invalid 修订
-  → `409`，且**不留下任何封存记录**。封存后到达的修订只改变实时结果，
-  **不能改写旧封存**；回查（见 4.10）返回冻结证据、摘要，并用当前批次
-  重算证据摘要给出 `consistent`（实时证据是否仍与封存一致）。
+  顺序无关）。校验与冻结在**一个原子事务**内完成，并发提交无法穿插改写。
+  相同批次下相同封存号 + 相同请求的重放返回**原快照**
+  （`status="duplicate"`，即使实时批次已变化、即使发生过重启）；封存号
+  相同但参数不同 → `409`；批次不存在 → `404`；哈希已变化或仍有
+  blocked/invalid 修订 → `409`，且**不留下任何封存记录**（事务回滚）。
+  封存证据持久化保存，重启后仍可回放原请求并取回原证据；封存后到达的
+  修订只改变实时结果，**不能改写旧封存**；回查（见 4.10）比较**持久化
+  封存证据**与当前批次重算的证据摘要并给出 `consistent`（实时证据是否
+  仍与封存一致）。
 
 ---
 
@@ -205,7 +251,10 @@ pytest -q
 - `withdrawn=false` 时 `value` 必填；`withdrawn=true` 时 `value` 可省略；
 - 响应 `200` 中 `status` 为 `accepted` / `duplicate`，并**直接带回该批次当前
   完整结果**（时间线、缺口、计数与哈希），便于流水线即时判断是否可补传；
-- 幂等键冲突或同修订 ID 内容冲突返回 `409`；参数非法返回 `422`。
+- 幂等键冲突或同修订 ID 内容冲突返回 `409`；参数非法返回 `422`；
+- 持久化后端下，多个进程并发提交同一修订/幂等键时，写入在一个
+  `BEGIN IMMEDIATE` 事务内串行：恰好一个请求得到 `accepted`，相同负载的
+  其余请求得到 `duplicate`，负载不同的得到 `409`；存储不可用返回 `503`。
 
 ### `POST /api/v1/batches/{batch_id}/events:preview` — 提交前预览修订影响（不写入）
 
@@ -740,7 +789,8 @@ $ curl -s -X POST localhost:8080/api/v1/batches/B42/majority \
 - `timeline_hash`：调用方先前从批次结果取得的整批哈希（64 位小写十六
   进制 SHA-256，格式非法返回 `422`）。路径 `batch_id` 必须与请求体一致。
 
-判定（全部在同一次加锁内的同一批次快照上完成）：
+判定（全部在同一事务（跨进程加锁）内的同一批次快照上完成；拒绝时事务
+回滚，不留任何记录）：
 
 - 该封存号已存在且请求与原始封存请求**完全相同** → `200`，
   `status="duplicate"`，返回**原快照**（即使实时批次此后已变化）；
@@ -762,7 +812,7 @@ $ curl -s -X POST localhost:8080/api/v1/batches/B42/majority \
 
 ### `GET /api/v1/batches/{batch_id}/seals/{seal_id}` — 回查封存证据
 
-返回封存时冻结的 `evidence` 与 `evidence_digest`，并用**当前**批次状态
+返回持久化保存的封存 `evidence` 与 `evidence_digest`，并用**当前**批次状态
 重算证据摘要：
 
 - `current_evidence_digest`：按当前全部修订与折叠结果重算的证据摘要
@@ -812,14 +862,37 @@ $ curl -s localhost:8080/api/v1/batches/B42/seals/SEAL-2026-001
 }
 ```
 
-### `POST /admin/reset` — 清空全部内存状态
+### `POST /admin/reset` — 清空全部状态
 
-返回被清除的批次数、事件数与封存数（`seals_removed`）；封存记录随重置
-一并清除。
+返回被清除的批次数、事件数与封存数（`seals_removed`）；在持久化后端下
+同样**删除数据库中的全部批次、幂等键映射与封存记录**（空库返回全 0，
+不报错）。批次数按出现过修订或封存的去重批次计。
 
 ### `GET /health` — 存活检查
 
+保留原有字段 `status` / `storage` / `version`；`storage` 如实标识当前
+后端：持久化模式为 `"sqlite"`，内存模式为 `"memory"`。
+
+```json
+{"status": "ok", "storage": "sqlite", "version": "2.0.0"}
+```
+
 ---
+
+## 4b. 持久化存储说明（SQLite）
+
+- 数据库包含三张表：`events`（修订，主键 `(batch_id, revision_id)`）、
+  `idempotency_keys`（幂等键 → 规范负载/修订，主键
+  `(batch_id, idempotency_key)`）、`seals`（封存号 → 冻结证据 JSON 与
+  证据摘要，主键 `(batch_id, seal_id)`）。
+- 同一修订的“插入修订 + 登记幂等键”、封存的“校验 + 冻结 + 插入封存”
+  都在**单个事务**内提交，任何中途失败整体回滚，不会出现半成品状态。
+- 数据库运行在 **WAL** 日志模式（`synchronous=NORMAL`）：多个进程可同时
+  读取，写入在库级互斥串行；等待锁的时长由 `CAL_SQLITE_BUSY_TIMEOUT_MS`
+  控制。备份时请同时复制 `.db`、`.db-wal`、`.db-shm`（或先做 SQLite
+  checkpoint）。
+- 数据库文件路径的父目录不存在时会自动创建；路径不可写/磁盘错误时，
+  启动直接失败，运行期读写错误返回 `503`，绝不当作空批次处理。
 
 ## 5. 典型使用流程
 
@@ -899,8 +972,37 @@ curl -s -X POST localhost:8080/api/v1/batches/B42/seals \
 #      evidence_digest 为覆盖两者的确定性 SHA-256 摘要
 curl -s localhost:8080/api/v1/batches/B42/seals/SEAL-2026-001
 #   -> 返回冻结证据与摘要；consistent 表示实时批次证据是否仍与封存一致
+
+# 9) 重启后（或请求落到另一个 worker 进程）数据仍在：
+#    原请求重放仍是 duplicate 并返回同一份证据；
+#    同封存号换参数 -> 409；回查比较持久封存与当前批次。
+curl -s -X POST localhost:8080/api/v1/batches/B42/seals \
+  -H 'Content-Type: application/json' \
+  -d "{\"batch_id\":\"B42\",\"seal_id\":\"SEAL-2026-001\",\"timeline_hash\":\"$HASH\"}"
+#   -> {"status":"duplicate", "evidence_digest":"e4f303ee…", "evidence":{ …原快照… }}
+
+# 10) 清空（持久化数据也一并删除）；返回准确计数
 curl -s -X POST localhost:8080/admin/reset
-#   -> 连同封存记录一并清除（seals_removed）
+#   -> {"status":"reset","batches_removed":N,"events_removed":M,"seals_removed":K}
+```
+
+### 多进程 / 重启持久化示例（默认 SQLite 后端）
+
+```bash
+# 单进程写入一个批次并封存
+CAL_SQLITE_PATH=./data/demo.db uvicorn app.main:app --port 8080 &
+curl -s -X POST localhost:8080/api/v1/batches/B1/events -H 'Content-Type: application/json' \
+  -d '{"batch_id":"B1","sensor_id":"S1","revision_id":"v1","parent_id":"ROOT",
+       "idempotency_key":"k1","start_ns":0,"end_ns":100,"value":1.0,"unit":"C"}'
+kill %1
+
+# 重启（任意个数进程）指向同一个数据库文件，状态完整可见
+CAL_SQLITE_PATH=./data/demo.db uvicorn app.main:app --port 8080 --workers 2 &
+curl -s localhost:8080/api/v1/batches/B1/result | jq .revisions_total   # -> 1
+# 同一请求在任一 worker 上重放都是 duplicate；新键重放同修订同内容登记新键
+# /health 的 storage 字段为 "sqlite"
+curl -s localhost:8080/health
+#   -> {"status":"ok","storage":"sqlite","version":"2.0.0"}
 ```
 
 撤回某一段（墓碑，区间内被擦除）：
@@ -920,14 +1022,14 @@ curl -s -X POST localhost:8080/admin/reset
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由：ingest / preview / result / sample / compare / quality-gate / release / majority / seals / reset / health
+│   ├── main.py       # FastAPI 路由：ingest / preview / result / sample / compare / quality-gate / release / majority / seals / reset / health（每个判定+求值包在单个 store 事务内）
 │   ├── engine.py     # 因果分类、区间切分折叠、预览影响计算、采样点查询、跨批次差异对比、质量门禁扫描、设备放行扫描、冗余传感器可信多数投票、批次封存证据与摘要、缺口与哈希（纯函数引擎）
-│   ├── storage.py    # 线程安全的内存存储、幂等判定、无副作用的提交预览判定与不可改写封存记录
+│   ├── storage.py    # 两种同构后端：线程安全的内存 EventStore 与持久化/多进程共享的 SqliteEventStore（WAL + BEGIN IMMEDIATE 跨进程事务），幂等判定、无副作用预览判定、不可改写封存记录与存储故障 StorageError
 │   ├── models.py     # Pydantic 请求/响应模型与校验
-│   └── config.py     # CAL_ 前缀环境变量配置
-├── tests/            # pytest（API 端到端 + 引擎单测，共 188 个用例）
+│   └── config.py     # CAL_ 前缀环境变量配置（CAL_STORAGE / CAL_SQLITE_PATH / CAL_SQLITE_BUSY_TIMEOUT_MS）
+├── tests/            # pytest（API 端到端 + 引擎单测 + SQLite 持久化/重启/跨进程/存储故障，共 207 个用例）
 ├── Dockerfile
-├── docker-compose.yml
+├── docker-compose.yml  # 双 worker + 命名卷 calibration-data 共享 SQLite 数据库
 ├── requirements.txt
 ├── requirements-dev.txt
 └── .env.example

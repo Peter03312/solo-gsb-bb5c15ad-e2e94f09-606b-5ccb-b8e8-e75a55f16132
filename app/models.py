@@ -674,5 +674,6 @@ class ResetResponse(StrictModel):
 
 class HealthResponse(StrictModel):
     status: Literal["ok"]
-    storage: Literal["memory"]
+    # Backend actually serving state: "sqlite" (durable, shared) or "memory".
+    storage: Literal["memory", "sqlite"]
     version: str

@@ -3,6 +3,18 @@ services:
     build: .
     image: calibration-timeline-service:latest
     container_name: calibration-api
+    # Two worker processes share the same durable SQLite database (WAL),
+    # demonstrating cross-process persistence of revisions, idempotency keys
+    # and sealed evidence. Drop "--workers 2" to run a single process.
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8080"
+      - --workers
+      - "2"
     ports:
       - "8080:8080"
     environment:
@@ -10,10 +22,22 @@ services:
       CAL_HOST: "0.0.0.0"
       CAL_PORT: "8080"
       CAL_LOG_LEVEL: "info"
+      # Durable, multi-process shared storage. The named volume keeps
+      # revisions, idempotency keys and seals across `docker compose restart`
+      # / `up` recreations. Use CAL_STORAGE=memory for the legacy ephemeral
+      # in-memory mode (state is lost on restart/reset).
+      CAL_STORAGE: "sqlite"
+      CAL_SQLITE_PATH: "/srv/data/calibration.db"
+      CAL_SQLITE_BUSY_TIMEOUT_MS: "10000"
+    volumes:
+      - calibration-data:/srv/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health').status==200 else 1)"]
       interval: 10s
       timeout: 3s
       retries: 5
-      start_period: 3s
+      start_period: 5s
+
+volumes:
+  calibration-data:

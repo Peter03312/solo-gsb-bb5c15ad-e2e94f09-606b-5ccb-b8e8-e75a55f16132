@@ -15,8 +15,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
+# Directory holding the durable SQLite database (WAL); mounted from a volume
+# by docker compose. Created here so the non-root runtime can write to it.
+RUN mkdir -p /srv/data
+
 EXPOSE 8080
 
-# Dependencies are installed at image build; initialization (logging, routes)
-# runs at process startup via the FastAPI lifespan.
+# Default single-process command; docker compose overrides this with two
+# worker processes sharing the same SQLite database file.
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]

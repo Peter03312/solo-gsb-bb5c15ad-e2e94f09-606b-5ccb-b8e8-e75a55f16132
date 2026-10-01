@@ -45,22 +45,34 @@ from .models import (
     SealRequest,
     SealResponse,
 )
-from .storage import BatchStore, EventStore, IdempotencyConflict, SealRecord, StoredEvent
+from .storage import (
+    BatchStore,
+    IdempotencyConflict,
+    SealRecord,
+    StorageError,
+    StoredEvent,
+    create_store,
+)
 
 logger = logging.getLogger("calibration")
 
 settings = get_settings()
-store = EventStore()
+# The store is created at startup. An unusable durable backend (bad path,
+# unwritable directory) raises StorageError here so the process fails fast
+# instead of silently serving an empty, non-persistent state.
+store = create_store(settings.storage, settings.sqlite_path)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> None:
     logging.basicConfig(level=settings.log_level.upper())
     logger.info(
-        "calibration-timeline-service %s started on %s:%s (storage=memory)",
+        "calibration-timeline-service %s started on %s:%s (storage=%s%s)",
         __version__,
         settings.host,
         settings.port,
+        store.backend,
+        f", path={settings.sqlite_path}" if store.backend == "sqlite" else "",
     )
     yield
     logger.info("calibration-timeline-service shutting down")
@@ -88,6 +100,18 @@ async def conflict_handler(_: Request, exc: IdempotencyConflict) -> JSONResponse
                 "different event payload"
             )
         },
+    )
+
+
+@app.exception_handler(StorageError)
+async def storage_error_handler(_: Request, exc: StorageError) -> JSONResponse:
+    # A backend failure must never be reported as an empty batch: surface it
+    # as a clear 503 so clients can retry instead of accepting fabricated
+    # "not found"/"empty" results.
+    logger.error("storage failure: %s", exc)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": f"storage unavailable: {exc}"},
     )
 
 
@@ -120,7 +144,7 @@ def _sanitize_errors(value: object) -> object:
 
 @app.get("/health", response_model=HealthResponse, tags=["ops"])
 def health() -> HealthResponse:
-    return HealthResponse(status="ok", storage="memory", version=__version__)
+    return HealthResponse(status="ok", storage=store.backend, version=__version__)
 
 
 @app.post(
@@ -148,7 +172,11 @@ def submit_event(batch_id: str, event: MeasurementEvent) -> IngestResponse:
         unit=event.unit,
         withdrawn=event.withdrawn,
     )
-    with store.lock:
+    # One cross-process transaction for the whole decision + evaluation:
+    # concurrent submissions serialize, the revision and its idempotency-key
+    # mapping commit together, and the returned result is computed on the
+    # same committed snapshot.
+    with store.transaction(write=True):
         status = store.add(stored)
         batch = store.get_batch(batch_id)
         result = evaluate_batch(batch_id, batch)
@@ -187,10 +215,11 @@ def preview_event(batch_id: str, event: MeasurementEvent) -> PreviewResponse:
         unit=event.unit,
         withdrawn=event.withdrawn,
     )
-    # One lock acquisition for the whole decision + evaluation: the preview is
-    # computed against one consistent batch snapshot, the same guarantee a
-    # concurrent real submission gets.
-    with store.lock:
+    # One lock/transaction for the whole decision + evaluation: the preview is
+    # computed against one consistent batch snapshot (held for the duration,
+    # including against concurrent processes on the durable backend), the
+    # same guarantee a concurrent real submission gets.
+    with store.transaction(write=False):
         status = store.classify_submission(stored)
         batch = store.get_batch(batch_id)
         if status == "duplicate":
@@ -221,10 +250,12 @@ def preview_event(batch_id: str, event: MeasurementEvent) -> PreviewResponse:
     summary="Query the effective calibration timeline for a batch",
 )
 def get_result(batch_id: str) -> BatchResult:
-    batch = store.get_batch(batch_id)
-    if batch is None or not batch.events:
-        raise HTTPException(status_code=404, detail=f"batch {batch_id!r} not found")
-    with store.lock:
+    with store.transaction(write=False):
+        batch = store.get_batch(batch_id)
+        if batch is None or not batch.events:
+            raise HTTPException(
+                status_code=404, detail=f"batch {batch_id!r} not found"
+            )
         result = evaluate_batch(batch_id, batch)
     return BatchResult(**result)
 
@@ -245,10 +276,10 @@ def get_sample(
         description="Batch-local nanosecond instant to resolve (half-open intervals).",
     ),
 ) -> SamplePointResponse:
-    batch = store.get_batch(batch_id)
-    if batch is None or not batch.events:
-        raise HTTPException(status_code=404, detail=f"batch {batch_id!r} not found")
-    with store.lock:
+    with store.transaction(write=False):
+        batch = store.get_batch(batch_id)
+        if batch is None or not batch.events:
+            raise HTTPException(status_code=404, detail=f"batch {batch_id!r} not found")
         doc = evaluate_sample(batch_id, sensor_id, timestamp_ns, batch)
     if doc is None:
         raise HTTPException(
@@ -270,17 +301,17 @@ def compare_batches(
     right_batch_id: str = Query(..., min_length=1, max_length=200),
     sensor_id: str = Query(..., min_length=1, max_length=200),
 ) -> CompareResponse:
-    left_batch = store.get_batch(left_batch_id)
-    if left_batch is None or not left_batch.events:
-        raise HTTPException(
-            status_code=404, detail=f"batch {left_batch_id!r} not found"
-        )
-    right_batch = store.get_batch(right_batch_id)
-    if right_batch is None or not right_batch.events:
-        raise HTTPException(
-            status_code=404, detail=f"batch {right_batch_id!r} not found"
-        )
-    with store.lock:
+    with store.transaction(write=False):
+        left_batch = store.get_batch(left_batch_id)
+        if left_batch is None or not left_batch.events:
+            raise HTTPException(
+                status_code=404, detail=f"batch {left_batch_id!r} not found"
+            )
+        right_batch = store.get_batch(right_batch_id)
+        if right_batch is None or not right_batch.events:
+            raise HTTPException(
+                status_code=404, detail=f"batch {right_batch_id!r} not found"
+            )
         left_events = find_sensor_events(left_batch, sensor_id)
         if left_events is None:
             raise HTTPException(
@@ -307,10 +338,12 @@ def compare_batches(
     responses={404: {"description": "Unknown batch or sensor"}},
 )
 def quality_gate(batch_id: str, gate: QualityGateRequest) -> QualityGateResponse:
-    batch = store.get_batch(batch_id)
-    if batch is None or not batch.events:
-        raise HTTPException(status_code=404, detail=f"batch {batch_id!r} not found")
-    with store.lock:
+    with store.transaction(write=False):
+        batch = store.get_batch(batch_id)
+        if batch is None or not batch.events:
+            raise HTTPException(
+                status_code=404, detail=f"batch {batch_id!r} not found"
+            )
         doc = evaluate_quality_gate(
             batch_id,
             gate.sensor_id,
@@ -336,9 +369,6 @@ def quality_gate(batch_id: str, gate: QualityGateRequest) -> QualityGateResponse
     responses={404: {"description": "Unknown batch or sensor"}},
 )
 def device_release(batch_id: str, query: ReleaseRequest) -> ReleaseResponse:
-    batch = store.get_batch(batch_id)
-    if batch is None or not batch.events:
-        raise HTTPException(status_code=404, detail=f"batch {batch_id!r} not found")
     requirements = [
         ReleaseRequirement(
             sensor_id=s.sensor_id,
@@ -348,9 +378,15 @@ def device_release(batch_id: str, query: ReleaseRequest) -> ReleaseResponse:
         )
         for s in query.sensors
     ]
-    # Read-only evaluation against one consistent batch snapshot: both the
-    # sensor-existence check and the sweep run under a single lock.
-    with store.lock:
+    # Read-only evaluation against one consistent batch snapshot: the batch
+    # load, sensor-existence check and the sweep run inside a single
+    # transaction (the cross-process snapshot guarantee on the durable store).
+    with store.transaction(write=False):
+        batch = store.get_batch(batch_id)
+        if batch is None or not batch.events:
+            raise HTTPException(
+                status_code=404, detail=f"batch {batch_id!r} not found"
+            )
         doc = evaluate_device_release(
             batch_id,
             query.window_start_ns,
@@ -383,13 +419,16 @@ def device_release(batch_id: str, query: ReleaseRequest) -> ReleaseResponse:
     responses={404: {"description": "Unknown batch or sensor"}},
 )
 def sensor_majority(batch_id: str, query: MajorityRequest) -> MajorityResponse:
-    batch = store.get_batch(batch_id)
-    if batch is None or not batch.events:
-        raise HTTPException(status_code=404, detail=f"batch {batch_id!r} not found")
     sensor_ids = [spec.sensor_id for spec in query.sensors]
-    # Read-only evaluation against one consistent batch snapshot: both the
-    # sensor-existence check and the sweep run under a single lock.
-    with store.lock:
+    # Read-only evaluation against one consistent batch snapshot: the batch
+    # load, sensor-existence check and the sweep run inside a single
+    # transaction (the cross-process snapshot guarantee on the durable store).
+    with store.transaction(write=False):
+        batch = store.get_batch(batch_id)
+        if batch is None or not batch.events:
+            raise HTTPException(
+                status_code=404, detail=f"batch {batch_id!r} not found"
+            )
         doc = evaluate_sensor_majority(
             batch_id,
             query.window_start_ns,
@@ -444,10 +483,12 @@ def seal_batch(batch_id: str, request: SealRequest) -> SealResponse:
             status_code=422,
             detail="batch_id in path and body must match",
         )
-    # One lock acquisition for the whole decision + snapshot: the replay
-    # check, the hash/completeness validation and the evidence capture all
-    # observe one consistent batch snapshot.
-    with store.lock:
+    # One transaction for the whole decision + snapshot: on the durable
+    # backend BEGIN IMMEDIATE is the cross-process lock, so the replay check,
+    # hash/completeness validation, evidence capture and seal insert commit
+    # atomically — no concurrent submission can interleave, and a rejected
+    # seal leaves no record.
+    with store.transaction(write=True):
         existing = store.get_seal(batch_id, request.seal_id)
         if existing is not None:
             if existing.timeline_hash == request.timeline_hash:
@@ -505,7 +546,7 @@ def seal_batch(batch_id: str, request: SealRequest) -> SealResponse:
     responses={404: {"description": "Unknown batch or seal"}},
 )
 def recall_seal(batch_id: str, seal_id: str) -> SealRecallResponse:
-    with store.lock:
+    with store.transaction(write=False):
         record = store.get_seal(batch_id, seal_id)
         if record is None:
             raise HTTPException(
@@ -532,12 +573,12 @@ def recall_seal(batch_id: str, seal_id: str) -> SealRecallResponse:
     "/admin/reset",
     response_model=ResetResponse,
     tags=["ops"],
-    summary="Clear all in-memory state",
+    summary="Clear all batches, events and seals",
 )
 def reset_state() -> ResetResponse:
     batches_removed, events_removed, seals_removed = store.reset()
     logger.warning(
-        "in-memory state reset: removed %d events across %d batches and %d seals",
+        "state reset: removed %d events across %d batches and %d seals",
         events_removed,
         batches_removed,
         seals_removed,
